@@ -54,13 +54,15 @@ manager = ConnectionManager()
 # Utility helpers
 # ---------------------------
 
-def to_obj_id(id_str: str):
-    from bson import ObjectId
 
+def to_obj_id(id_str: str):
     try:
+        # Memory IDs pass-through; Mongo IDs should be valid ObjectId
+        from bson import ObjectId  # type: ignore
         return ObjectId(id_str)
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid ID format")
+        # In-memory fallback uses string IDs; just return the string for filters
+        return id_str
 
 
 # ---------------------------
@@ -86,11 +88,11 @@ def test_database():
         if db is not None:
             response["database"] = "✅ Available"
             response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-            response["database_name"] = db.name if hasattr(db, "name") else "✅ Connected"
+            response["database_name"] = getattr(db, "name", "memory")
             response["connection_status"] = "Connected"
             try:
                 collections = db.list_collection_names()
-                response["collections"] = collections[:10]
+                response["collections"] = list(collections)[:10]
                 response["database"] = "✅ Connected & Working"
             except Exception as e:
                 response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
@@ -117,7 +119,7 @@ def ensure_demo_project() -> str:
     # Try to find existing demo project
     project = db["project"].find_one({"name": "Leadflow Demo"})
     if project:
-        return str(project["_id"])
+        return str(project.get("_id"))
 
     steps = ["Acquisition", "Setter", "Closer", "Vente"]
     project_id = create_document(
@@ -131,12 +133,12 @@ def ensure_demo_project() -> str:
         {"name": "Casey Closer", "email": "closer@leadflow.app", "role": "closer"},
         {"name": "Vera Viewer", "email": "viewer@leadflow.app", "role": "viewer"},
     ]
-    user_ids = []
+    user_ids: List[str] = []
     for u in users:
         uid = create_document("user", {**u, "permissions": [], "leads_assignes": []})
         user_ids.append(uid)
 
-    # Generate random leads
+    # Generate random leads (~120)
     first_names = [
         "Leo",
         "Maya",
@@ -149,9 +151,18 @@ def ensure_demo_project() -> str:
         "Sofia",
         "Lucas",
         "Mila",
+        "Hugo",
+        "Zoé",
+        "Nina",
+        "Eden",
+        "Léa",
+        "Noé",
+        "Chloé",
+        "Jade",
+        "Louis",
     ]
     sources = ["Ads", "Referral", "Website", "Outbound", "Event"]
-    for i in range(35):
+    for i in range(120):
         name = random.choice(first_names) + f" {random.randint(100,999)}"
         step_index = random.choices([0, 1, 2, 3], weights=[5, 4, 3, 2])[0]
         current_step = steps[step_index]
@@ -179,7 +190,8 @@ def ensure_demo_project() -> str:
         create_document("lead", lead)
 
     # Attach members to project
-    db["project"].update_one({"_id": to_obj_id(project_id)}, {"$set": {"members": user_ids}})
+    # Works for both memory and mongo ids
+    db["project"].update_one({"_id": project_id}, {"$set": {"members": user_ids}})
 
     return project_id
 
@@ -187,8 +199,9 @@ def ensure_demo_project() -> str:
 @app.get("/api/demo/bootstrap", response_model=DemoBootstrapResponse)
 def demo_bootstrap():
     project_id = ensure_demo_project()
-    project = db["project"].find_one({"_id": to_obj_id(project_id)})
-    users = list(db["user"].find({"_id": {"$in": [to_obj_id(u) for u in project.get("members", [])]}}))
+    project = db["project"].find_one({"_id": project_id}) or db["project"].find_one({"_id": to_obj_id(project_id)})
+    steps: List[str] = project.get("steps", []) if project else ["Acquisition", "Setter", "Closer", "Vente"]
+    users = list(db["user"].find({}))
     for u in users:
         u["id"] = str(u.pop("_id"))
     leads = list(db["lead"].find({"project_id": project_id}))
@@ -196,7 +209,7 @@ def demo_bootstrap():
         l["id"] = str(l.pop("_id"))
     return {
         "project_id": project_id,
-        "steps": project.get("steps", []),
+        "steps": steps,
         "users": users,
         "leads": leads,
     }
@@ -215,7 +228,7 @@ def list_projects():
 
 @app.get("/api/projects/{project_id}")
 def get_project(project_id: str):
-    project = db["project"].find_one({"_id": to_obj_id(project_id)})
+    project = db["project"].find_one({"_id": project_id}) or db["project"].find_one({"_id": to_obj_id(project_id)})
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     project["id"] = str(project.pop("_id"))
@@ -226,10 +239,10 @@ def get_project(project_id: str):
 def list_users(project_id: Optional[str] = None):
     query: Dict = {}
     if project_id:
-        project = db["project"].find_one({"_id": to_obj_id(project_id)})
+        project = db["project"].find_one({"_id": project_id}) or db["project"].find_one({"_id": to_obj_id(project_id)})
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
-        member_ids = [to_obj_id(u) for u in project.get("members", [])]
+        member_ids = project.get("members", [])
         query = {"_id": {"$in": member_ids}}
     users = list(db["user"].find(query))
     for u in users:
@@ -252,7 +265,7 @@ def get_leads(project_id: Optional[str] = None, assigned_to: Optional[str] = Non
 
 @app.get("/api/leads/{lead_id}")
 def get_lead(lead_id: str):
-    lead = db["lead"].find_one({"_id": to_obj_id(lead_id)})
+    lead = db["lead"].find_one({"_id": lead_id}) or db["lead"].find_one({"_id": to_obj_id(lead_id)})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
     lead["id"] = str(lead.pop("_id"))
@@ -265,11 +278,12 @@ class AdvanceRequest(BaseModel):
 
 @app.post("/api/leads/{lead_id}/advance")
 async def advance_lead(lead_id: str, payload: AdvanceRequest):
-    lead = db["lead"].find_one({"_id": to_obj_id(lead_id)})
+    lead = db["lead"].find_one({"_id": lead_id}) or db["lead"].find_one({"_id": to_obj_id(lead_id)})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
 
-    project = db["project"].find_one({"name": "Leadflow Demo"}) if not lead.get("project_id") else db["project"].find_one({"_id": to_obj_id(lead["project_id"])})
+    project_id = lead.get("project_id")
+    project = db["project"].find_one({"_id": project_id}) if project_id else None
     if not project:
         raise HTTPException(status_code=400, detail="Project not found for lead")
     steps = project.get("steps", [])
@@ -289,12 +303,12 @@ async def advance_lead(lead_id: str, payload: AdvanceRequest):
         status = "won"
 
     db["lead"].update_one(
-        {"_id": to_obj_id(lead_id)},
+        {"_id": lead_id},
         {
             "$set": {"current_step": new_step, "status": status, "updated_at": datetime.now(timezone.utc)},
             "$push": {
                 "history": {
-                    "project_id": str(project.get("_id")),
+                    "project_id": project_id,
                     "lead_id": lead_id,
                     "type": "advanced",
                     "from_step": current_step,
@@ -307,11 +321,11 @@ async def advance_lead(lead_id: str, payload: AdvanceRequest):
 
     # Broadcast event
     await manager.broadcast(
-        str(project.get("_id")),
+        str(project_id),
         {"type": "lead_advanced", "lead_id": lead_id, "from": current_step, "to": new_step},
     )
 
-    updated = db["lead"].find_one({"_id": to_obj_id(lead_id)})
+    updated = db["lead"].find_one({"_id": lead_id}) or db["lead"].find_one({"_id": to_obj_id(lead_id)})
     updated["id"] = str(updated.pop("_id"))
     return updated
 
@@ -322,7 +336,7 @@ class AssignRequest(BaseModel):
 
 @app.post("/api/leads/{lead_id}/assign")
 async def assign_lead(lead_id: str, payload: AssignRequest):
-    lead = db["lead"].find_one({"_id": to_obj_id(lead_id)})
+    lead = db["lead"].find_one({"_id": lead_id}) or db["lead"].find_one({"_id": to_obj_id(lead_id)})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
 
@@ -332,12 +346,12 @@ async def assign_lead(lead_id: str, payload: AssignRequest):
 
     user_id = payload.user_id
     if user_id is not None:
-        user = db["user"].find_one({"_id": to_obj_id(user_id)})
+        user = db["user"].find_one({"_id": user_id}) or db["user"].find_one({"_id": to_obj_id(user_id)})
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
 
     db["lead"].update_one(
-        {"_id": to_obj_id(lead_id)},
+        {"_id": lead_id},
         {
             "$set": {"assigned_to": user_id, "updated_at": datetime.now(timezone.utc)},
             "$push": {
@@ -357,7 +371,7 @@ async def assign_lead(lead_id: str, payload: AssignRequest):
         {"type": "lead_assigned", "lead_id": lead_id, "to_user": user_id},
     )
 
-    updated = db["lead"].find_one({"_id": to_obj_id(lead_id)})
+    updated = db["lead"].find_one({"_id": lead_id}) or db["lead"].find_one({"_id": to_obj_id(lead_id)})
     updated["id"] = str(updated.pop("_id"))
     return updated
 
@@ -368,7 +382,7 @@ async def advance_random(project_id: str):
     if not leads:
         raise HTTPException(status_code=404, detail="No leads in project")
     lead = random.choice(leads)
-    return await advance_lead(str(lead["_id"]))
+    return await advance_lead(str(lead["_id"]), AdvanceRequest())
 
 
 # ---------------------------
