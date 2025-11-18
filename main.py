@@ -203,7 +203,7 @@ def demo_bootstrap():
 
 
 # ---------------------------
-# Projects & Leads
+# Projects, Users & Leads
 # ---------------------------
 @app.get("/api/projects")
 def list_projects():
@@ -220,6 +220,21 @@ def get_project(project_id: str):
         raise HTTPException(status_code=404, detail="Project not found")
     project["id"] = str(project.pop("_id"))
     return project
+
+
+@app.get("/api/users")
+def list_users(project_id: Optional[str] = None):
+    query: Dict = {}
+    if project_id:
+        project = db["project"].find_one({"_id": to_obj_id(project_id)})
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        member_ids = [to_obj_id(u) for u in project.get("members", [])]
+        query = {"_id": {"$in": member_ids}}
+    users = list(db["user"].find(query))
+    for u in users:
+        u["id"] = str(u.pop("_id"))
+    return users
 
 
 @app.get("/api/leads")
@@ -301,6 +316,52 @@ async def advance_lead(lead_id: str, payload: AdvanceRequest):
     return updated
 
 
+class AssignRequest(BaseModel):
+    user_id: Optional[str]
+
+
+@app.post("/api/leads/{lead_id}/assign")
+async def assign_lead(lead_id: str, payload: AssignRequest):
+    lead = db["lead"].find_one({"_id": to_obj_id(lead_id)})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    project_id = lead.get("project_id")
+    if not project_id:
+        raise HTTPException(status_code=400, detail="Lead missing project")
+
+    user_id = payload.user_id
+    if user_id is not None:
+        user = db["user"].find_one({"_id": to_obj_id(user_id)})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+    db["lead"].update_one(
+        {"_id": to_obj_id(lead_id)},
+        {
+            "$set": {"assigned_to": user_id, "updated_at": datetime.now(timezone.utc)},
+            "$push": {
+                "history": {
+                    "project_id": project_id,
+                    "lead_id": lead_id,
+                    "type": "assigned",
+                    "to_user": user_id,
+                    "created_at": datetime.now(timezone.utc),
+                }
+            },
+        },
+    )
+
+    await manager.broadcast(
+        project_id,
+        {"type": "lead_assigned", "lead_id": lead_id, "to_user": user_id},
+    )
+
+    updated = db["lead"].find_one({"_id": to_obj_id(lead_id)})
+    updated["id"] = str(updated.pop("_id"))
+    return updated
+
+
 @app.post("/api/projects/{project_id}/advance-random")
 async def advance_random(project_id: str):
     leads = list(db["lead"].find({"project_id": project_id}))
@@ -318,7 +379,7 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
     await manager.connect(project_id, websocket)
     try:
         while True:
-            # We don't expect messages from client for now; keep alive
+            # Keep connection alive; ignore incoming messages
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(project_id, websocket)
